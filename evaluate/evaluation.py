@@ -1,48 +1,18 @@
-import torch
-
-# print("PyTorch version:", torch.__version__)
-# print("CUDA available:", torch.cuda.is_available())
-# print("CUDA version:", torch.version.cuda)
-# print("GPU count:", torch.cuda.device_count())
-#
-# if torch.cuda.is_available():
-#     print("GPU name:", torch.cuda.get_device_name(0))
-
-
-# import os
-#
-# root_dir = r"D:\JetBrains\PycharmProjects\reserch"
-# max_level = 2  # 1=一级，2=二级
-#
-# for root, dirs, files in os.walk(root_dir):
-#     level = root.replace(root_dir, "").count(os.sep) + 1
-#     if level > max_level:
-#         continue
-#     indent = " " * 4 * (level - 1)
-#     print(f"{indent}{os.path.basename(root)}/")
-#     for f in files:
-#         print(f"{indent}    {f}")
-
-# import datasets
-# print(datasets.__version__)
-# print(hasattr(datasets, "Dataset"))  # True
-
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 from pathlib import Path
 import torch
 import json
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+import jieba
+from nltk.translate.bleu_score import sentence_bleu
 from rouge_score import rouge_scorer
 from sentence_transformers import SentenceTransformer, util
-import math
+from nltk.translate.bleu_score import SmoothingFunction
 
 # -------------------------------
 # 0. 配置路径
 # -------------------------------
-base_model_path = Path(
-    r"D:\JetBrains\PycharmProjects\reserch\model_cache\Qwen--Qwen2.5-7B-Instruct\snapshots\a09a35458c702b33eeacc393d103063234e8bc28"
-)
+base_model_path = Path(r"D:\JetBrains\PycharmProjects\reserch\model_cache\Qwen--Qwen2.5-7B-Instruct\snapshots\a09a35458c702b33eeacc393d103063234e8bc28")
 lora_model_path = Path(r"D:\JetBrains\PycharmProjects\reserch\model\lora-model")
 eval_data_path = Path(r"D:\JetBrains\PycharmProjects\reserch\datasets\eval.json")
 
@@ -73,25 +43,11 @@ base_model = AutoModelForCausalLM.from_pretrained(
 # 4. 加载 LoRA 模型
 # -------------------------------
 print("Loading LoRA model...")
-lora_model = PeftModel.from_pretrained(base_model, lora_model_path, torch_dtype=torch.float16)
+lora_model = PeftModel.from_pretrained(base_model, lora_model_path, device_map="auto")
+lora_model.to(device)
 
 # -------------------------------
-# 5. 检查 LoRA 权重
-# -------------------------------
-def check_lora_weights(model):
-    total_lora = 0
-    print("\nChecking LoRA parameters:")
-    for name, module in model.named_modules():
-        if hasattr(module, "weight") and "lora" in name:
-            norm = module.weight.data.norm().item()
-            print(f"{name}: shape={module.weight.shape}, norm={norm:.6f}")
-            total_lora += 1
-    print(f"Total LoRA parameters found: {total_lora}\n")
-
-check_lora_weights(lora_model)
-
-# -------------------------------
-# 6. 加载评估数据
+# 5. 加载评估数据
 # -------------------------------
 with open(eval_data_path, "r", encoding="utf-8") as f:
     data = json.load(f)
@@ -100,22 +56,24 @@ inputs = [x["instruction"] for x in data]
 references = [x["output"] for x in data]
 
 # -------------------------------
-# 7. 语义相似度模型
+# 6. 语义相似度模型
 # -------------------------------
 sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# -------------------------------
+# 7. 中文分词函数
+# -------------------------------
+def tokenize_cn(text):
+    return " ".join(jieba.cut(text))
 
 # -------------------------------
 # 8. 评估函数
 # -------------------------------
 def evaluate_model(model, inputs, references, max_new_tokens=128):
     model.eval()
-    ppl_list = []
-    bleu_list = []
-    rouge_list = []
-    semantic_sim_list = []
+    ppl_list, bleu_list, rouge_list, semantic_sim_list = [], [], [], []
 
     scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
-    smoothing = SmoothingFunction().method1
 
     for inp, ref in zip(inputs, references):
         prompt = f"用户：{inp}\n助手："
@@ -146,13 +104,22 @@ def evaluate_model(model, inputs, references, max_new_tokens=128):
             ppl = torch.exp(loss.mean()).item()
             ppl_list.append(ppl)
 
+
+
         # ---------- BLEU ----------
-        bleu_score = sentence_bleu([ref.split()], pred.split(), smoothing_function=smoothing)
+        smooth_fn = SmoothingFunction().method1
+
+        bleu_score = sentence_bleu(
+            [tokenize_cn(ref).split()],
+            tokenize_cn(pred).split(),
+            weights=(0.5, 0.5),
+            smoothing_function=smooth_fn
+        )
         bleu_list.append(bleu_score)
 
         # ---------- ROUGE ----------
-        rouge_score = scorer.score(ref, pred)
-        rouge_list.append(rouge_score)
+        rouge_score_dict = scorer.score(tokenize_cn(ref), tokenize_cn(pred))
+        rouge_list.append(rouge_score_dict)
 
         # ---------- Semantic Similarity ----------
         emb_ref = sbert_model.encode(ref, convert_to_tensor=True)
@@ -185,12 +152,3 @@ print("Base model metrics:", base_metrics)
 print("\nEvaluating LoRA model...")
 lora_metrics = evaluate_model(lora_model, inputs, references)
 print("LoRA model metrics:", lora_metrics)
-
-# -------------------------------
-# 10. 测试生成
-# -------------------------------
-test_prompt = "请用中文简单介绍机器学习是什么？"
-inputs_tensor = tokenizer([f"用户：{test_prompt}\n助手："], return_tensors="pt").to(device)
-outputs = lora_model.generate(**inputs_tensor, max_new_tokens=128, pad_token_id=tokenizer.eos_token_id)
-test_response = tokenizer.decode(outputs[0], skip_special_tokens=True).split("助手：")[-1].strip()
-print("\nTest generation output:\n", test_response)

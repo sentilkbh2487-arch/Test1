@@ -10,7 +10,7 @@ from peft import LoraConfig, get_peft_model
 # -----------------------------
 dataset_path = Path(r"D:\JetBrains\PycharmProjects\reserch\datasets\train_lora.json")
 model_cache_path = r"D:\\JetBrains\\PycharmProjects\\reserch\\model_cache\\Qwen--Qwen2.5-7B-Instruct\\snapshots\\a09a35458c702b33eeacc393d103063234e8bc28"
-output_model_path = Path("model/lora-model")  # 保存微调模型
+output_model_path = Path(r"D:\\JetBrains\\PycharmProjects\\reserch\\model\\lora-model")  # 保存微调模型
 
 # -----------------------------
 # 加载数据
@@ -78,8 +78,7 @@ class Dataset(torch.utils.data.Dataset):
 train_dataset = Dataset(train_encodings)
 valid_dataset = Dataset(valid_encodings)
 
-# -----------------------------
-# 训练参数
+# -----------------------------# 训练参数
 # -----------------------------
 training_args = TrainingArguments(
     output_dir=output_model_path,
@@ -102,7 +101,6 @@ trainer = Trainer(
     train_dataset=train_dataset,
     eval_dataset=valid_dataset
 )
-
 # -----------------------------
 # 开始训练
 # -----------------------------
