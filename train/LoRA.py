@@ -1,115 +1,182 @@
-# train/train_lora.py
+import argparse
 import json
 from pathlib import Path
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
-from peft import LoraConfig, get_peft_model
+import jieba
+import sys
 
-# -----------------------------
-# 配置路径
-# -----------------------------
-dataset_path = Path(r"D:\JetBrains\PycharmProjects\reserch\datasets\train_lora.json")
-model_cache_path = r"D:\\JetBrains\\PycharmProjects\\reserch\\model_cache\\Qwen--Qwen2.5-7B-Instruct\\snapshots\\a09a35458c702b33eeacc393d103063234e8bc28"
-output_model_path = Path(r"D:\\JetBrains\\PycharmProjects\\reserch\\model\\lora-model")  # 保存微调模型
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import PeftModel
 
-# -----------------------------
-# 加载数据
-# -----------------------------
-with open(dataset_path, "r", encoding="utf-8") as f:
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from rouge_score import rouge_scorer
+from sentence_transformers import SentenceTransformer, util
+
+# -------------------------------
+# 参数解析
+# -------------------------------
+def choose_mode():
+    # 如果命令行传了参数，就优先用（兼容论文复现）
+    if len(sys.argv) > 1:
+        arg = sys.argv[1].lower()
+        if arg in ["base", "lora"]:
+            return arg
+
+    # 否则进入交互模式
+    while True:
+        print("\n请选择评估模式：")
+        print("1. Base Model")
+        print("2. LoRA Model")
+
+        choice = input("请输入编号 (1/2)：").strip()
+
+        if choice == "1":
+            return "base"
+        elif choice == "2":
+            return "lora"
+        else:
+            print("输入错误，请重新输入！")
+
+mode = choose_mode()
+
+# -------------------------------
+# 路径
+# -------------------------------
+base_model_path = Path(r"D:\JetBrains\PycharmProjects\reserch\model_cache\Qwen--Qwen2.5-7B-Instruct\snapshots\a09a35458c702b33eeacc393d103063234e8bc28")
+lora_model_path = Path(r"D:\JetBrains\PycharmProjects\reserch\model\lora-model\checkpoint-348")  # ⚠️ 改成最新checkpoint
+eval_data_path = Path(r"D:\JetBrains\PycharmProjects\reserch\datasets\eval.json")
+
+# -------------------------------
+# 设备
+# -------------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16
+)
+
+# -------------------------------
+# tokenizer
+# -------------------------------
+tokenizer = AutoTokenizer.from_pretrained(
+    base_model_path,
+    trust_remote_code=True,
+    local_files_only=True
+)
+
+# -------------------------------
+# 加载模型（关键）
+# -------------------------------
+def load_model(mode):
+    print(f"Loading {mode} model...")
+
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        device_map="auto",
+        quantization_config=bnb_config,
+        trust_remote_code=True
+    )
+
+    if mode == "base":
+        return base
+
+    elif mode == "lora":
+        model = PeftModel.from_pretrained(
+            base,
+            lora_model_path,
+            device_map="auto"
+        )
+        return model
+
+model = load_model(mode)
+
+# -------------------------------
+# 数据
+# -------------------------------
+with open(eval_data_path, "r", encoding="utf-8") as f:
     data = json.load(f)
 
-train_data = data["train"]
-valid_data = data["valid"]
+inputs = [x["instruction"] for x in data]
+references = [x["output"] for x in data]
 
-# -----------------------------
-# 加载 tokenizer 和模型
-# -----------------------------
-tokenizer = AutoTokenizer.from_pretrained(model_cache_path, trust_remote_code=True, local_files_only=True)
+# -------------------------------
+# 语义模型
+# -------------------------------
+sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# ⚠️ 强制全模型到 GPU，避免 meta-device 错误
-model = AutoModelForCausalLM.from_pretrained(
-    model_cache_path,
-    device_map=None,         # 不使用 auto，手动搬到 GPU
-    trust_remote_code=True,
-    torch_dtype=torch.float16
-)
-model = model.to("cuda")  # 🔑 所有层放到 GPU
+def tokenize_cn(text):
+    return " ".join(jieba.cut(text))
 
-# -----------------------------
-# LoRA 配置
-# -----------------------------
-lora_config = LoraConfig(
-    r=8,
-    lora_alpha=16,
-    target_modules=["q_proj","v_proj"],  # 注意力层注入
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM"
-)
-model = get_peft_model(model, lora_config)
+# -------------------------------
+# 评估函数
+# -------------------------------
+def evaluate(model):
+    model.eval()
 
-# -----------------------------
-# 数据 Tokenize（Instruction-Response 格式）
-# -----------------------------
-MAX_LENGTH = 128  # 显存受限，128 足够大部分指令
+    ppl_list, bleu_list, rouge_list, sim_list = [], [], [], []
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
+    smooth = SmoothingFunction().method1
 
-def preprocess(example):
-    instruction = example["instruction"]
-    output = example["output"]
-    text = f"用户：{instruction}\n助手：{output}"
-    return tokenizer(text, truncation=True, padding="max_length", max_length=MAX_LENGTH)
+    for inp, ref in zip(inputs, references):
 
-train_encodings = [preprocess(x) for x in train_data]
-valid_encodings = [preprocess(x) for x in valid_data]
+        prompt = f"用户：{inp}\n助手："
 
-class Dataset(torch.utils.data.Dataset):
-    def __init__(self, encodings):
-        self.encodings = encodings
+        inputs_tensor = tokenizer(prompt, return_tensors="pt").to(device)
 
-    def __len__(self):
-        return len(self.encodings)
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs_tensor,
+                max_new_tokens=128,
+                do_sample=False
+            )
 
-    def __getitem__(self, idx):
-        # ⚠️ labels 需要和 input_ids 一致，用于 CausalLM loss 计算
-        item = {k: torch.tensor(v) for k, v in self.encodings[idx].items()}
-        item['labels'] = item['input_ids'].clone()
-        return item
+        pred = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        pred = pred.split("助手：")[-1].strip()
 
-train_dataset = Dataset(train_encodings)
-valid_dataset = Dataset(valid_encodings)
+        # ---------- PPL ----------
+        with torch.no_grad():
+            enc = tokenizer(prompt + ref, return_tensors="pt").to(device)
+            labels = enc["input_ids"]
 
-# -----------------------------# 训练参数
-# -----------------------------
-training_args = TrainingArguments(
-    output_dir=output_model_path,
-    per_device_train_batch_size=1,   # batch size = 1
-    gradient_accumulation_steps=8,   # 累积 8 步等效 batch 8
-    num_train_epochs=3,
-    learning_rate=2e-4,
-    logging_steps=10,
-    save_steps=100,
-    eval_strategy="epoch",            # 每轮结束评估一次
-    save_total_limit=2,
-    fp16=True,                        # 混合精度
-    optim="adamw_torch",
-    push_to_hub=False
-)
+            out = model(**enc, labels=labels)
+            loss = out.loss
+            ppl = torch.exp(loss).item()
 
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=valid_dataset
-)
-# -----------------------------
-# 开始训练
-# -----------------------------
-trainer.train()
+        ppl_list.append(ppl)
 
-# -----------------------------
-# 保存微调模型
-# -----------------------------
-output_model_path.mkdir(parents=True, exist_ok=True)
-model.save_pretrained(output_model_path)
-tokenizer.save_pretrained(output_model_path)
-print("LoRA 微调完成，模型已保存到 model/lora-model")
+        # ---------- BLEU ----------
+        bleu = sentence_bleu(
+            [tokenize_cn(ref).split()],
+            tokenize_cn(pred).split(),
+            smoothing_function=smooth
+        )
+        bleu_list.append(bleu)
+
+        # ---------- ROUGE ----------
+        rouge = scorer.score(tokenize_cn(ref), tokenize_cn(pred))
+        rouge_list.append(rouge)
+
+        # ---------- 语义 ----------
+        emb1 = sbert_model.encode(ref, convert_to_tensor=True)
+        emb2 = sbert_model.encode(pred, convert_to_tensor=True)
+
+        sim = util.cos_sim(emb1, emb2).item()
+        sim_list.append(sim)
+
+    return {
+        "PPL": sum(ppl_list) / len(ppl_list),
+        "BLEU": sum(bleu_list) / len(bleu_list),
+        "ROUGE-1": sum(r['rouge1'].fmeasure for r in rouge_list) / len(rouge_list),
+        "ROUGE-L": sum(r['rougeL'].fmeasure for r in rouge_list) / len(rouge_list),
+        "Semantic Similarity": sum(sim_list) / len(sim_list)
+    }
+
+# -------------------------------
+# 执行
+# -------------------------------
+metrics = evaluate(model)
+
+print(f"\n=== {mode.upper()} RESULT ===")
+print(metrics)

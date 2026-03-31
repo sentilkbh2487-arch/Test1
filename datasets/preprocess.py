@@ -3,8 +3,8 @@ import json
 # -----------------------------
 # 1️⃣ 输入输出路径
 # -----------------------------
-input_path = r"/datasets/toy_data.json"
-output_path = r"/datasets/train_lora.json"
+input_path = r"toy_data.json"
+output_path = r"train_lora.json"
 
 # -----------------------------
 # 2️⃣ 读取原始数据
