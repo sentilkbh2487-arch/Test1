@@ -1,53 +1,101 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from peft import PeftModel
+import argparse
+import json
 from pathlib import Path
 import torch
-import json
 import jieba
-from nltk.translate.bleu_score import sentence_bleu
+import sys
+
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import PeftModel
+
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from rouge_score import rouge_scorer
 from sentence_transformers import SentenceTransformer, util
-from nltk.translate.bleu_score import SmoothingFunction
 
 # -------------------------------
-# 0. 配置路径
+# 参数解析
+# -------------------------------
+def choose_mode():
+    # 如果命令行传了参数，就优先用
+    if len(sys.argv) > 1:
+        arg = sys.argv[1].lower()
+        if arg in ["base", "lora"]:
+            return arg
+
+    # 否则进入交互模式
+    while True:
+        print("\n请选择评估模式：")
+        print("1. Base Model")
+        print("2. LoRA Model")
+        choice = input("请输入编号 (1/2)：").strip()
+
+        if choice == "1":
+            return "base"
+        elif choice == "2":
+            return "lora"
+        else:
+            print("输入错误，请重新输入！")
+
+mode = choose_mode()
+
+# -------------------------------
+# 路径
 # -------------------------------
 base_model_path = Path(r"D:\JetBrains\PycharmProjects\reserch\model_cache\Qwen--Qwen2.5-7B-Instruct\snapshots\a09a35458c702b33eeacc393d103063234e8bc28")
-lora_model_path = Path(r"D:\JetBrains\PycharmProjects\reserch\model\lora-model")
+lora_model_path = Path(r"D:\JetBrains\PycharmProjects\reserch\model\lora-model\checkpoint-348")  # 最新 checkpoint
 eval_data_path = Path(r"D:\JetBrains\PycharmProjects\reserch\datasets\eval.json")
 
 # -------------------------------
-# 1. GPU & 4bit 配置
+# 输出文件路径（根据模式区分）
+# -------------------------------
+output_dir = Path(r"D:\JetBrains\PycharmProjects\reserch\results")
+output_dir.mkdir(parents=True, exist_ok=True)
+output_file_path = output_dir / f"eval_results_{mode}.json"
+
+# -------------------------------
+# 设备 & 量化配置
 # -------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
 print(f"Using device: {device}")
 
-# -------------------------------
-# 2. 加载 tokenizer
-# -------------------------------
-tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True, local_files_only=True)
+bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
 
 # -------------------------------
-# 3. 加载原始模型
+# Tokenizer
 # -------------------------------
-print("Loading base model...")
-base_model = AutoModelForCausalLM.from_pretrained(
+tokenizer = AutoTokenizer.from_pretrained(
     base_model_path,
-    device_map="auto",
-    quantization_config=bnb_config,
-    trust_remote_code=True
+    trust_remote_code=True,
+    local_files_only=True
 )
 
 # -------------------------------
-# 4. 加载 LoRA 模型
+# 加载模型
 # -------------------------------
-print("Loading LoRA model...")
-lora_model = PeftModel.from_pretrained(base_model, lora_model_path, device_map="auto")
-lora_model.to(device)
+def load_model(mode):
+    print(f"Loading {mode} model...")
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        device_map="auto",
+        quantization_config=bnb_config,
+        trust_remote_code=True
+    )
+
+    if mode == "base":
+        return base
+    elif mode == "lora":
+        model = PeftModel.from_pretrained(
+            base,
+            str(lora_model_path),
+            device_map="auto"
+        )
+        return model
+
+model = load_model(mode)
+model.to(device)
 
 # -------------------------------
-# 5. 加载评估数据
+# 数据
 # -------------------------------
 with open(eval_data_path, "r", encoding="utf-8") as f:
     data = json.load(f)
@@ -56,99 +104,114 @@ inputs = [x["instruction"] for x in data]
 references = [x["output"] for x in data]
 
 # -------------------------------
-# 6. 语义相似度模型
-# -------------------------------
-sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
-
-# -------------------------------
-# 7. 中文分词函数
+# 中文分词 & 语义模型
 # -------------------------------
 def tokenize_cn(text):
     return " ".join(jieba.cut(text))
 
-# -------------------------------
-# 8. 评估函数
-# -------------------------------
-def evaluate_model(model, inputs, references, max_new_tokens=128):
-    model.eval()
-    ppl_list, bleu_list, rouge_list, semantic_sim_list = [], [], [], []
+sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
 
+# -------------------------------
+# 评估函数
+# -------------------------------
+def evaluate_and_save(model, inputs, references, tokenizer, device, output_file):
+    model.eval()
+    results = []
+
+    ppl_list, bleu_list, rouge_list, sim_list = [], [], [], []
     scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
+    smooth = SmoothingFunction().method1
+    sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
 
     for inp, ref in zip(inputs, references):
-        prompt = f"用户：{inp}\n助手："
+        prompt = f"你是一个温柔细腻的人，直接回答下面的问题，不编造信息，也不要复述问题：\n问题：{inp}\n回答："
+        inputs_tensor = tokenizer(prompt, return_tensors="pt").to(device)
 
-        # 编码输入
-        inputs_tensor = tokenizer([prompt], return_tensors="pt").to(device)
-
-        # 生成回答
+        # 生成
         with torch.no_grad():
             outputs = model.generate(
-                **inputs_tensor,
-                max_new_tokens=max_new_tokens,
-                pad_token_id=tokenizer.eos_token_id
+                input_ids=inputs_tensor["input_ids"],
+                attention_mask=inputs_tensor.get("attention_mask"),
+                max_new_tokens=10,  # 限制最大长度
+                do_sample=False,     # 是否启用才采样，True启用
+                top_p=0.8,                # nucleus sampling
+                top_k=30,
+                temperature=0.1,    # 限制随机性
+                repetition_penalty=1.2,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                early_stopping=True,  # 达到 EOS 时提前结束
+                length_penalty=0.1  # <1.0更倾向短句, >1.0更长
             )
 
-        # 解码
-        pred = tokenizer.decode(outputs[0], skip_special_tokens=True).split("助手：")[-1].strip()
+        pred = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # 去掉 prompt 前缀
+        if "回答：" in pred:
+            pred = pred.split("回答：")[-1].strip()
+
+        # 去掉输入文本或 Human 等无关前缀
+        for prefix in [inp, "Human:", "用户："]:
+            pred = pred.replace(prefix, "").strip()
 
         # ---------- PPL ----------
         with torch.no_grad():
-            enc = tokenizer(prompt + pred, return_tensors="pt").to(device)
+            enc = tokenizer(prompt + ref, return_tensors="pt").to(device)
             labels = enc["input_ids"]
-            outputs_logits = model(**enc).logits
-            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id, reduction='none')
-            shift_logits = outputs_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            ppl = torch.exp(loss.mean()).item()
+            out = model(**enc, labels=labels)
+            loss = out.loss
+            ppl = torch.exp(loss).item()
             ppl_list.append(ppl)
 
-
-
         # ---------- BLEU ----------
-        smooth_fn = SmoothingFunction().method1
-
-        bleu_score = sentence_bleu(
-            [tokenize_cn(ref).split()],
-            tokenize_cn(pred).split(),
-            weights=(0.5, 0.5),
-            smoothing_function=smooth_fn
-        )
-        bleu_list.append(bleu_score)
+        bleu = sentence_bleu([tokenize_cn(ref).split()], tokenize_cn(pred).split(), smoothing_function=smooth)
+        bleu_list.append(bleu)
 
         # ---------- ROUGE ----------
-        rouge_score_dict = scorer.score(tokenize_cn(ref), tokenize_cn(pred))
-        rouge_list.append(rouge_score_dict)
+        rouge_score_val = scorer.score(tokenize_cn(ref), tokenize_cn(pred))
+        rouge_list.append(rouge_score_val)
 
-        # ---------- Semantic Similarity ----------
+        # ---------- 语义相似度 ----------
         emb_ref = sbert_model.encode(ref, convert_to_tensor=True)
         emb_pred = sbert_model.encode(pred, convert_to_tensor=True)
         sim = util.cos_sim(emb_ref, emb_pred).item()
-        semantic_sim_list.append(sim)
+        sim_list.append(sim)
 
-    # 平均指标
-    avg_ppl = sum(ppl_list) / len(ppl_list)
-    avg_bleu = sum(bleu_list) / len(bleu_list)
-    avg_rouge1 = sum([r['rouge1'].fmeasure for r in rouge_list]) / len(rouge_list)
-    avg_rougeL = sum([r['rougeL'].fmeasure for r in rouge_list]) / len(rouge_list)
-    avg_sem_sim = sum(semantic_sim_list) / len(semantic_sim_list)
+        # ---------- 保存每条样本 ----------
+        results.append({
+            "instruction": inp,
+            "reference": ref,
+            "prediction": pred,
+            "PPL": ppl,
+            "BLEU": bleu,
+            "ROUGE-1": rouge_score_val['rouge1'].fmeasure,
+            "ROUGE-L": rouge_score_val['rougeL'].fmeasure,
+            "Semantic Similarity": sim
+        })
 
-    return {
-        "PPL": avg_ppl,
-        "BLEU": avg_bleu,
-        "ROUGE-1": avg_rouge1,
-        "ROUGE-L": avg_rougeL,
-        "Semantic Similarity": avg_sem_sim
+    # ---------- 平均指标 ----------
+    avg_metrics = {
+        "PPL": sum(ppl_list)/len(ppl_list),
+        "BLEU": sum(bleu_list)/len(bleu_list),
+        "ROUGE-1": sum(r['rouge1'].fmeasure for r in rouge_list)/len(rouge_list),
+        "ROUGE-L": sum(r['rougeL'].fmeasure for r in rouge_list)/len(rouge_list),
+        "Semantic Similarity": sum(sim_list)/len(sim_list)
     }
 
-# -------------------------------
-# 9. 执行评估
-# -------------------------------
-print("Evaluating base model...")
-base_metrics = evaluate_model(base_model, inputs, references)
-print("Base model metrics:", base_metrics)
+    # ---------- 保存 JSON ----------
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "mode": mode,
+            "average_metrics": avg_metrics,
+            "samples": results
+        }, f, ensure_ascii=False, indent=2)
 
-print("\nEvaluating LoRA model...")
-lora_metrics = evaluate_model(lora_model, inputs, references)
-print("LoRA model metrics:", lora_metrics)
+    return avg_metrics, results
+
+# -------------------------------
+# 执行评估
+metrics, all_results = evaluate_and_save(model, inputs, references, tokenizer, device, output_file_path)
+
+print(f"\n=== {mode.upper()} METRICS ===")
+print(metrics)
+print(f"\n评估完成！结果已保存到 {output_file_path}")
