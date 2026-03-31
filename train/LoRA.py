@@ -67,7 +67,7 @@ def preprocess(example):
     output = example["output"].strip()
 
     # 🔹 强化训练提示：只回答问题，不复述、不编造
-    text = f"你是一个温柔细腻的人，只回答问题，不复述问题，不编造信息。\n用户：{instruction}\n助手：{output}{EOS_TOKEN}"
+    text = f"你是一个温柔细腻的人，直接回答下面的问题，不编造信息，也不要复述问题：\n问题：{instruction}\n回答：{output}{EOS_TOKEN}"
 
     enc = tokenizer(
         text,
@@ -91,7 +91,7 @@ class Dataset(torch.utils.data.Dataset):
         item = {k: torch.tensor(v) for k, v in self.encodings[idx].items()}
 
         # ⚠️ 只计算回答部分 loss，mask 掉 instruction
-        instruction_len = len(tokenizer(f"你是一个温柔细腻的人，只回答问题，不复述问题，不编造信息。\n用户：{train_data[idx]['instruction']}\n助手：")["input_ids"])
+        instruction_len = len(tokenizer(f"你是一个温柔细腻的人，直接回答下面的问题，不编造信息，也不要复述问题：\n问题：{train_data[idx]['instruction']}\n回答：")["input_ids"])
         labels = item['input_ids'].clone()
         labels[:instruction_len] = -100
         item['labels'] = labels

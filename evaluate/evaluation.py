@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 import jieba
 import sys
+import re
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
@@ -123,25 +124,33 @@ def evaluate_and_save(model, inputs, references, tokenizer, device, output_file)
     smooth = SmoothingFunction().method1
     sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
 
+    unwanted_prefixes = ["用户：", "助手：", "Human:", "问题："]
+
     for inp, ref in zip(inputs, references):
         prompt = f"你是一个温柔细腻的人，直接回答下面的问题，不编造信息，也不要复述问题：\n问题：{inp}\n回答："
         inputs_tensor = tokenizer(prompt, return_tensors="pt").to(device)
+
+        # 根据输入长度自适应生成长度
+        input_len = len(tokenizer.encode(prompt))
+        min_gen_len = 8
+        max_gen_len = 64
+        gen_len = min(max(int(input_len * 0.8), min_gen_len), max_gen_len)
 
         # 生成
         with torch.no_grad():
             outputs = model.generate(
                 input_ids=inputs_tensor["input_ids"],
                 attention_mask=inputs_tensor.get("attention_mask"),
-                max_new_tokens=10,  # 限制最大长度
-                do_sample=False,     # 是否启用才采样，True启用
-                top_p=0.8,                # nucleus sampling
+                max_new_tokens=gen_len,
+                do_sample=True,       # 启用采样避免重复
+                top_p=0.8,
                 top_k=30,
-                temperature=0.1,    # 限制随机性
+                temperature=0.6,      # 限制随机性
                 repetition_penalty=1.2,
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 early_stopping=True,  # 达到 EOS 时提前结束
-                length_penalty=0.1  # <1.0更倾向短句, >1.0更长
+                length_penalty=0.1    # <1.0更倾向短句, >1.0更长
             )
 
         pred = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -150,9 +159,11 @@ def evaluate_and_save(model, inputs, references, tokenizer, device, output_file)
         if "回答：" in pred:
             pred = pred.split("回答：")[-1].strip()
 
-        # 去掉输入文本或 Human 等无关前缀
-        for prefix in [inp, "Human:", "用户："]:
-            pred = pred.replace(prefix, "").strip()
+        # 检测到无关前缀就删除从该前缀开始的整段内容
+        for prefix in unwanted_prefixes:
+            if prefix in pred:
+                pattern = re.escape(prefix) + ".*"
+                pred = re.sub(pattern, "", pred, flags=re.DOTALL).strip()
 
         # ---------- PPL ----------
         with torch.no_grad():
