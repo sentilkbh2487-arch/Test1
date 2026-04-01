@@ -43,7 +43,7 @@ mode = choose_mode()
 # 路径
 # -------------------------------
 base_model_path = Path(r"D:\JetBrains\PycharmProjects\reserch\model_cache\Qwen--Qwen2.5-7B-Instruct\snapshots\a09a35458c702b33eeacc393d103063234e8bc28")
-lora_model_path = Path(r"D:\JetBrains\PycharmProjects\reserch\model\lora-model\checkpoint-348")  # 最新 checkpoint
+lora_model_path = Path(r"D:\JetBrains\PycharmProjects\reserch\model\lora-model\checkpoint-549")  # 最新 checkpoint
 eval_data_path = Path(r"D:\JetBrains\PycharmProjects\reserch\datasets\eval.json")
 
 # -------------------------------
@@ -62,7 +62,7 @@ print(f"Using device: {device}")
 bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
 
 # -------------------------------
-# Tokenizer
+# Tokenizer（统一使用 base + 手动扩展）
 # -------------------------------
 tokenizer = AutoTokenizer.from_pretrained(
     base_model_path,
@@ -70,11 +70,22 @@ tokenizer = AutoTokenizer.from_pretrained(
     local_files_only=True
 )
 
+# 🔥 你的自定义 EOS token（必须和训练一致）
+EOS_TOKEN = "<|endofanswer|>"
+
+if EOS_TOKEN not in tokenizer.get_vocab():
+    tokenizer.add_special_tokens({"additional_special_tokens": [EOS_TOKEN]})
+
+# 避免 warning
+tokenizer.pad_token = tokenizer.eos_token
+
+
 # -------------------------------
-# 加载模型
+# 加载模型（关键修改）
 # -------------------------------
 def load_model(mode):
     print(f"Loading {mode} model...")
+
     base = AutoModelForCausalLM.from_pretrained(
         base_model_path,
         device_map="auto",
@@ -82,8 +93,12 @@ def load_model(mode):
         trust_remote_code=True
     )
 
+    # 🔥 关键：让 base 模型适配 tokenizer（解决 size mismatch）
+    base.resize_token_embeddings(len(tokenizer))
+
     if mode == "base":
         return base
+
     elif mode == "lora":
         model = PeftModel.from_pretrained(
             base,
@@ -91,6 +106,7 @@ def load_model(mode):
             device_map="auto"
         )
         return model
+
 
 model = load_model(mode)
 model.to(device)
@@ -133,7 +149,7 @@ def evaluate_and_save(model, inputs, references, tokenizer, device, output_file)
         # 根据输入长度自适应生成长度
         input_len = len(tokenizer.encode(prompt))
         min_gen_len = 8
-        max_gen_len = 64
+        max_gen_len = 48
         gen_len = min(max(int(input_len * 0.8), min_gen_len), max_gen_len)
 
         # 生成
@@ -146,7 +162,7 @@ def evaluate_and_save(model, inputs, references, tokenizer, device, output_file)
                 top_p=0.8,
                 top_k=30,
                 temperature=0.6,      # 限制随机性
-                repetition_penalty=1.2,
+                repetition_penalty=1.8,
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 early_stopping=True,  # 达到 EOS 时提前结束
