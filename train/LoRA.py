@@ -10,7 +10,7 @@ from peft import LoraConfig, get_peft_model
 # -----------------------------
 dataset_path = Path(r"D:\JetBrains\PycharmProjects\reserch\datasets\train_lora.json")
 model_cache_path = r"D:\\JetBrains\\PycharmProjects\\reserch\\model_cache\\Qwen--Qwen2.5-7B-Instruct\\snapshots\\a09a35458c702b33eeacc393d103063234e8bc28"
-output_model_path = Path(r"D:\\JetBrains\\PycharmProjects\\reserch\\model\\lora-model1")  # 保存微调模型
+output_model_path = Path(r"D:\\JetBrains\\PycharmProjects\\reserch\\model\\lora-model2")  # 保存微调模型
 
 # -----------------------------
 # 加载数据
@@ -105,12 +105,12 @@ valid_dataset = Dataset(valid_encodings)
 # -----------------------------
 training_args = TrainingArguments(
     output_dir=output_model_path,
-    per_device_train_batch_size=3,
-    # gradient_accumulation_steps=8,
-    num_train_epochs=3,
-    learning_rate=2e-4,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,   # 🔥 恢复稳定batch
+    num_train_epochs=2,              # 🔥 降低epoch（防过拟合）
+    learning_rate=5e-5,              # 🔥 降学习率（关键）
     logging_steps=10,
-    save_steps=100,
+    save_steps=200,
     eval_strategy="epoch",
     save_total_limit=2,
     fp16=True,
