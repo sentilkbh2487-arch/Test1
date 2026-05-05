@@ -45,6 +45,7 @@ mode = choose_mode()
 base_model_path = Path(r"D:\JetBrains\PycharmProjects\reserch\model_cache\Qwen--Qwen2.5-7B-Instruct\snapshots\a09a35458c702b33eeacc393d103063234e8bc28")
 lora_model_path = Path(r"D:\JetBrains\PycharmProjects\reserch\model\lora-model\checkpoint-549")  # 最新 checkpoint
 eval_data_path = Path(r"D:\JetBrains\PycharmProjects\reserch\datasets\eval.json")
+style_path = Path(r"D:\JetBrains\PycharmProjects\reserch\datasets\style_corpus.txt")
 
 # -------------------------------
 # 输出文件路径（根据模式区分）
@@ -121,24 +122,46 @@ inputs = [x["instruction"] for x in data]
 references = [x["output"] for x in data]
 
 # -------------------------------
-# 中文分词 & 语义模型
+# SBERT
 # -------------------------------
-def tokenize_cn(text):
-    return " ".join(jieba.cut(text))
+sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
+# -------------------------------
+# 风格语料
+# -------------------------------
+with open(style_path, "r", encoding="utf-8") as f:
+    style_texts = [line.strip() for line in f if line.strip()]
+
+style_emb = sbert_model.encode(style_texts, convert_to_tensor=True)
+
+# -------------------------------
+# ROUGE / BLEU
+# -------------------------------
+scorer = rouge_scorer.RougeScorer(["rouge1", "rougeL"], use_stemmer=False)
+smooth = SmoothingFunction().method1
+
+# -------------------------------
+# 工具函数
+# -------------------------------
+def clean_pred(text):
+    if "回答：" in text:
+        text = text.split("回答：")[-1]
+    return text.strip()
+
 
 # -------------------------------
 # 评估函数
 # -------------------------------
 def evaluate_and_save(model, inputs, references, tokenizer, device, output_file):
-    model.eval()
-    results = []
 
-    ppl_list, bleu_list, rouge_list, sim_list = [], [], [], []
-    scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
-    smooth = SmoothingFunction().method1
-    sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
+    model.eval()
+    ppl_list = []
+    bleu_list = []
+    rouge_list = []
+    style_list = []
+    content_list = []
+
+    results = []
 
     unwanted_prefixes = ["用户：", "助手：", "Human:", "问题："]
 
@@ -170,62 +193,85 @@ def evaluate_and_save(model, inputs, references, tokenizer, device, output_file)
             )
 
         pred = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        pred = clean_pred(pred)
 
-        # 去掉 prompt 前缀
-        if "回答：" in pred:
-            pred = pred.split("回答：")[-1].strip()
+        for p in unwanted_prefixes:
+            if pred.startswith(p):
+                pred = pred[len(p):].strip()
 
-        # 检测到无关前缀就删除从该前缀开始的整段内容
-        for prefix in unwanted_prefixes:
-            if prefix in pred:
-                pattern = re.escape(prefix) + ".*"
-                pred = re.sub(pattern, "", pred, flags=re.DOTALL).strip()
+        if len(pred) == 0:
+            pred = "无回答"
 
-        # ---------- PPL ----------
+        # ===============================
+        # PPL
+        # ===============================
         with torch.no_grad():
             enc = tokenizer(prompt + ref, return_tensors="pt").to(device)
-            labels = enc["input_ids"]
-            out = model(**enc, labels=labels)
-            loss = out.loss
-            ppl = torch.exp(loss).item()
+            out = model(**enc, labels=enc["input_ids"])
+            ppl = torch.exp(out.loss).item()
             ppl_list.append(ppl)
 
-        # ---------- BLEU ----------
-        bleu = sentence_bleu([tokenize_cn(ref).split()], tokenize_cn(pred).split(), smoothing_function=smooth)
+        # ===============================
+        # BLEU（字符级）
+        # ===============================
+        bleu = sentence_bleu(
+            [list(ref)],
+            list(pred),
+            smoothing_function=smooth
+        )
         bleu_list.append(bleu)
 
-        # ---------- ROUGE ----------
-        rouge_score_val = scorer.score(tokenize_cn(ref), tokenize_cn(pred))
-        rouge_list.append(rouge_score_val)
+        # ===============================
+        # ROUGE
+        # ===============================
+        rouge = scorer.score(ref, pred)
+        rouge_list.append(rouge)
 
-        # ---------- 语义相似度 ----------
-        emb_ref = sbert_model.encode(ref, convert_to_tensor=True)
+        # ===============================
+        # 风格相似度（核心）
+        # ===============================
         emb_pred = sbert_model.encode(pred, convert_to_tensor=True)
-        sim = util.cos_sim(emb_ref, emb_pred).item()
-        sim_list.append(sim)
+        style_score = util.cos_sim(emb_pred, style_emb).mean().item()
+        style_list.append(style_score)
 
-        # ---------- 保存每条样本 ----------
+        # ===============================
+        # 内容相似度
+        # ===============================
+        emb_ref = sbert_model.encode(ref, convert_to_tensor=True)
+        content_score = util.cos_sim(emb_ref, emb_pred).item()
+        content_list.append(content_score)
+
+        # ===============================
+        # 保存样本
+        # ===============================
         results.append({
             "instruction": inp,
             "reference": ref,
             "prediction": pred,
             "PPL": ppl,
             "BLEU": bleu,
-            "ROUGE-1": rouge_score_val['rouge1'].fmeasure,
-            "ROUGE-L": rouge_score_val['rougeL'].fmeasure,
-            "Semantic Similarity": sim
+            "ROUGE-1": rouge["rouge1"].fmeasure,
+            "ROUGE-L": rouge["rougeL"].fmeasure,
+            "Style Similarity": style_score,
+            "Content Similarity": content_score,
+            "gen_len": gen_len
         })
 
-    # ---------- 平均指标 ----------
+    # ===============================
+    # 平均指标（必须在循环外）
+    # ===============================
     avg_metrics = {
-        "PPL": sum(ppl_list)/len(ppl_list),
-        "BLEU": sum(bleu_list)/len(bleu_list),
-        "ROUGE-1": sum(r['rouge1'].fmeasure for r in rouge_list)/len(rouge_list),
-        "ROUGE-L": sum(r['rougeL'].fmeasure for r in rouge_list)/len(rouge_list),
-        "Semantic Similarity": sum(sim_list)/len(sim_list)
+        "PPL": sum(ppl_list) / len(ppl_list),
+        "BLEU": sum(bleu_list) / len(bleu_list),
+        "ROUGE-1": sum(r["rouge1"].fmeasure for r in rouge_list) / len(rouge_list),
+        "ROUGE-L": sum(r["rougeL"].fmeasure for r in rouge_list) / len(rouge_list),
+        "Style Similarity": sum(style_list) / len(style_list),
+        "Content Similarity": sum(content_list) / len(content_list)
     }
 
-    # ---------- 保存 JSON ----------
+    # ===============================
+    # 保存
+    # ===============================
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump({
             "mode": mode,
@@ -233,12 +279,21 @@ def evaluate_and_save(model, inputs, references, tokenizer, device, output_file)
             "samples": results
         }, f, ensure_ascii=False, indent=2)
 
-    return avg_metrics, results
+    return avg_metrics
+
 
 # -------------------------------
-# 执行评估
-metrics, all_results = evaluate_and_save(model, inputs, references, tokenizer, device, output_file_path)
+# run
+# -------------------------------
+metrics = evaluate_and_save(
+    model,
+    inputs,
+    references,
+    tokenizer,
+    device,
+    output_file_path
+)
 
-print(f"\n=== {mode.upper()} METRICS ===")
+print("\n=== FINAL METRICS ===")
 print(metrics)
-print(f"\n评估完成！结果已保存到 {output_file_path}")
+print("\nSaved to:", output_file_path)
